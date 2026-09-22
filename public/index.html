@@ -162,6 +162,36 @@
         <div class="topic-history" id="topic-history"></div>
       </div>
 
+      <!-- 行动项 -->
+      <div class="panel panel-actions">
+        <div class="panel-title">
+          ✅ 行动项 <span class="count" id="action-count">0</span>
+          <button class="btn btn-primary btn-mini host-only action-create-toggle" id="btn-action-new"
+                  type="button" title="从当前成员中指定负责人并填写事项与截止时间">＋ 指派行动项</button>
+        </div>
+
+        <!-- 主持人：指派行动项 -->
+        <form class="action-create host-only is-hidden" id="action-create-form">
+          <input type="text" id="action-title-input" maxlength="120"
+                 placeholder="行动事项（如：周五前整理会议纪要）" autocomplete="off" />
+          <div class="action-create-row">
+            <label class="action-field" title="从当前成员中指定负责人">
+              负责人
+              <select id="action-assignee"></select>
+            </label>
+            <label class="action-field" title="截止时间">
+              截止
+              <input type="datetime-local" id="action-deadline" step="60" />
+            </label>
+            <button class="btn btn-primary btn-mini" type="submit">指派</button>
+            <button class="btn btn-ghost btn-mini" id="btn-action-cancel-form" type="button">取消</button>
+          </div>
+        </form>
+
+        <!-- 分组展示：待接受 / 处理中 / 待确认 / 已完成·已拒绝 -->
+        <div class="action-board" id="action-board"></div>
+      </div>
+
       <!-- 右侧：记录 + 成员 -->
       <div class="panel panel-side panel-logs">
         <div class="panel-title">

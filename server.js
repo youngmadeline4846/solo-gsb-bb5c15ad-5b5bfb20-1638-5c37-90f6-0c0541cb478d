@@ -28,6 +28,12 @@
  *   { type: "topic_end",    version }                      // 主持人：提前结束并结算当前议题
  *   { type: "topic_vote",   version, topicId, choice }     // choice=yes|no|abstain；截止前可改投
  *   { type: "quota_reset",  version, durationMin }         // 主持人：开启/重置发言配额周期（1~30 分钟）
+ *   { type: "action_create",  version, title, assigneeId, deadline }  // 主持人：指派行动项（deadline 为毫秒时间戳）
+ *   { type: "action_accept",  version, actionId }          // 负责人：接受（pending -> in_progress）
+ *   { type: "action_reject",  version, actionId }          // 负责人：拒绝（pending -> rejected）
+ *   { type: "action_done",    version, actionId }          // 负责人：标记完成（in_progress -> review）
+ *   { type: "action_confirm", version, actionId }          // 主持人：确认完成（review -> completed）
+ *   { type: "action_return",  version, actionId }          // 主持人：退回处理中（review -> in_progress）
  *
  * 服务端 -> 客户端
  *   { type: "joined",  snapshot, you:{id,secret,host} }
@@ -81,6 +87,19 @@
  * clearTimeout 并替换 room.topic，旧回调直接忽略，绝不结算后续议题。
  * 结算结果（赞成/反对/弃权票数与通过/否决/平票结论）追加到 room.topicHistory
  * 并随快照下发，断线重连后实时票数、剩余时间与已结算结果均连续恢复。
+ *
+ * 行动项：主持人 action_create 从当前成员中指派负责人，填写事项与截止时间
+ * （毫秒时间戳，不早于当前时刻、不超过一年后），初始状态 pending（待接受）。
+ * 负责人 action_accept / action_reject 接受或拒绝；接受后可 action_done 标记
+ * 完成进入 review（待确认）；主持人 action_confirm 确认完成（completed）或
+ * action_return 退回处理中（in_progress）。全部命令走现有版本守卫，且同时
+ * 校验操作者身份与当前状态（错误状态/越权分别返回 ACTION_STATE /
+ * ACTION_NOT_YOURS，actionId 不符返回 NO_ACTION），过期命令返回最新快照，
+ * 因此多端重复确认或越权跳转都不可能成功。负责人主动离开房间时，其尚未
+ * 应答的行动项自动标记为已拒绝；处理中/待确认的行动项保留状态（昵称显示
+ * 「已离开」），主持人仍可确认/退回。行动项随快照 actions 字段下发（含
+ * 每条最近若干条状态变更记录 history 与截止时间），断线重连后恢复，
+ * 截止时间仅用于展示与超期标红，不会自动改变状态。
  */
 
 'use strict';
@@ -116,6 +135,14 @@ const TOPIC_MAX_SECONDS = parseInt(process.env.TOPIC_MAX_SECONDS, 10) || 3600;
 const TOPIC_HISTORY_LIMIT = parseInt(process.env.TOPIC_HISTORY_LIMIT, 10) || 20;
 const TOPIC_TITLE_MAX = 80;
 const VOTE_CHOICES = ['yes', 'no', 'abstain'];
+// 行动项：事项文本长度、保留数量与每条保留的状态变更记录条数
+const ACTION_TITLE_MAX = 120;
+const ACTION_LIMIT = 200;
+const ACTION_HISTORY_LIMIT = 20;
+// 截止时间合法范围：不早于当前时刻，不超过一年后（毫秒）
+const ACTION_MAX_DEADLINE_MS = 366 * 24 * 60 * 60 * 1000;
+// 创建时对「截止时间已过」的宽容窗口（客户端时钟偏差）；测试可调大以快速构造自然过期场景
+const ACTION_MIN_DEADLINE_MS = parseInt(process.env.ACTION_MIN_DEADLINE_MS, 10) || 0;
 
 const app = express();
 const server = http.createServer(app);
@@ -174,6 +201,13 @@ app.use(express.static(path.join(__dirname, 'public')));
  *     id, title, createdAt, closedAt, endedBy,   // endedBy: 'deadline'|'host'|'replaced'
  *     counts: { yes, no, abstain }, total, result  // result: passed|rejected|tie
  *   }],
+ *   actions: [{             // 行动项（最新在前，超过 ACTION_LIMIT 滚动淘汰）
+ *     id, title, assigneeId, hostId,
+ *     createdAt, deadline,              // deadline：毫秒时间戳（仅展示，不驱动状态）
+ *     status,                           // pending|in_progress|review|completed|rejected
+ *     decidedAt,                        // 进入终态（completed/rejected）的时间
+ *     history: [{ kind, by, byNick, ts }]
+ *   }],
  *   logs: [{id, ts, kind, text}],
  *   createdAt, lastSeen
  * }
@@ -197,6 +231,7 @@ function newRoom(code) {
     undo: null,
     topic: null,
     topicHistory: [],
+    actions: [],
     logs: [],
     createdAt: Date.now(),
     lastSeen: Date.now()
@@ -640,6 +675,126 @@ function buildTopicView(topic) {
 }
 
 // ---------------------------------------------------------------------------
+// 行动项：主持人指派 -> 负责人接受/拒绝 -> 标记完成 -> 主持人确认/退回
+// ---------------------------------------------------------------------------
+
+/**
+ * 行动项状态机：
+ *   pending      --负责人接受-->      in_progress
+ *   pending      --负责人拒绝-->      rejected（终态）
+ *   in_progress  --负责人标记完成-->  review
+ *   review       --主持人确认完成-->  completed（终态）
+ *   review       --主持人退回-->      in_progress
+ * 每个动作都由命令处理同时校验操作者身份与当前状态，状态机外的跳转一律拒绝。
+ */
+const ACTION_KIND_TEXT = {
+  created: '创建行动项',
+  accepted: '负责人接受',
+  rejected: '负责人拒绝',
+  done: '负责人标记完成',
+  confirmed: '主持人确认完成',
+  returned: '主持人退回处理中',
+  auto_rejected: '负责人离开，自动标记为已拒绝'
+};
+
+/** 追加一条状态变更记录（每条行动项只保留最近 ACTION_HISTORY_LIMIT 条） */
+function addActionHistory(room, action, kind, by, byNick) {
+  action.history.push({ kind, by, byNick: byNick || null, ts: Date.now() });
+  if (action.history.length > ACTION_HISTORY_LIMIT) {
+    action.history.splice(0, action.history.length - ACTION_HISTORY_LIMIT);
+  }
+}
+
+/**
+ * 执行一次行动项状态流转：校验状态机合法性，更新状态、追加历史与操作记录。
+ * 调用前已完成版本守卫、actionId 与操作者身份校验。
+ */
+function transitionAction(room, action, kind, by, byNick, logText) {
+  action.status = {
+    accepted: 'in_progress',
+    rejected: 'rejected',
+    done: 'review',
+    confirmed: 'completed',
+    returned: 'in_progress'
+  }[kind];
+  if (kind === 'confirmed' || kind === 'rejected') {
+    action.decidedAt = Date.now();
+  }
+  addActionHistory(room, action, kind, by, byNick);
+  addLog(room, 'action', logText);
+  pruneActions(room);
+}
+
+/**
+ * 行动项数量上限滚动淘汰：超过 ACTION_LIMIT 时优先淘汰最旧的终态项
+ * （completed/rejected）；全是非终态时才淘汰最旧项，避免内存无界增长。
+ */
+function pruneActions(room) {
+  while (room.actions.length > ACTION_LIMIT) {
+    let idx = -1;
+    for (let i = room.actions.length - 1; i >= 0; i--) {
+      const s = room.actions[i].status;
+      if (s === 'completed' || s === 'rejected') { idx = i; break; }
+    }
+    if (idx === -1) idx = room.actions.length - 1;
+    room.actions.splice(idx, 1);
+  }
+}
+
+/**
+ * 主持人指派行动项：负责人必须是当前房间成员；截止时间为毫秒时间戳，
+ * 不早于当前时刻、不超过一年后。调用前已完成主持人与版本守卫。
+ */
+function createAction(room, title, assigneeId, deadline) {
+  const now = Date.now();
+  const action = {
+    id: genId('ac_'),
+    title,
+    assigneeId,
+    hostId: room.hostId,
+    createdAt: now,
+    deadline,
+    status: 'pending',
+    decidedAt: null,
+    history: []
+  };
+  addActionHistory(room, action, 'created', room.hostId, room.participants.get(room.hostId)?.nick ?? null);
+  room.actions.unshift(action);
+  pruneActions(room);
+  const nick = room.participants.get(assigneeId)?.nick ?? '已离开';
+  addLog(room, 'action', `主持人指派「${nick}」负责行动项「${title}」`);
+  return action;
+}
+
+/** 行动项快照视图：含负责人/主持人昵称与最近状态变更记录 */
+function buildActionView(room, a) {
+  const assignee = room.participants.get(a.assigneeId);
+  const host = room.participants.get(a.hostId);
+  // history 中操作者昵称在变更时已快照（操作者随后离开也能正确展示）；
+  // by 为 null（负责人离开自动拒绝）时展示「系统」
+  const history = a.history.map((h) => ({
+    kind: h.kind,
+    by: h.by,
+    byNick: h.byNick || (h.by ? (room.participants.get(h.by)?.nick ?? '已离开') : '系统'),
+    ts: h.ts
+  }));
+  return {
+    id: a.id,
+    title: a.title,
+    assigneeId: a.assigneeId,
+    assigneeNick: assignee ? assignee.nick : '已离开',
+    assigneeOnline: assignee ? assignee.online : false,
+    hostId: a.hostId,
+    hostNick: host ? host.nick : '已离开',
+    createdAt: a.createdAt,
+    deadline: a.deadline,
+    status: a.status,
+    decidedAt: a.decidedAt,
+    history
+  };
+}
+
+// ---------------------------------------------------------------------------
 // 安全撤销
 // ---------------------------------------------------------------------------
 
@@ -652,6 +807,7 @@ const UNDO_REASON_TEXT = {
   rollcall_changed: '队首点名接力状态出现新的变更',
   topic_changed: '议题投票状态出现新的变更',
   quota_changed: '发言配额周期出现新的变更',
+  action_changed: '行动项状态出现新的变更',
   cleared: '主持人清空了队列',
   logs_cleared: '主持人清空了操作记录',
   state_changed: '房间状态出现新的变更'
@@ -846,6 +1002,7 @@ function buildSnapshot(room) {
       total: t.total,
       result: t.result
     })),
+    actions: room.actions.map((a) => buildActionView(room, a)),
     logs: room.logs.slice(-200)
   };
 }
@@ -973,6 +1130,12 @@ wss.on('connection', (ws) => {
         case 'topic_end':
         case 'topic_vote':
         case 'quota_reset':
+        case 'action_create':
+        case 'action_accept':
+        case 'action_reject':
+        case 'action_done':
+        case 'action_confirm':
+        case 'action_return':
           return handleCommand(ws, msg, room, pid, isHost);
 
         default:
@@ -1153,6 +1316,16 @@ function handleLeave(room, id, reason) {
   if (queuedIdx !== -1) room.order.splice(queuedIdx, 1);
   room.participants.delete(id);
   if (room.quota) room.quota.used.delete(id); // 主动离开：清除其本周期已用额度记录
+  // 行动项：尚未应答（待接受）的指派随离开自动拒绝；处理中/待确认的保留状态
+  for (const a of room.actions) {
+    if (a.assigneeId === id && a.status === 'pending') {
+      a.status = 'rejected';
+      a.decidedAt = Date.now();
+      addActionHistory(room, a, 'auto_rejected', null, '系统');
+      addLog(room, 'action', `「${nick}」离开房间，行动项「${a.title}」自动标记为已拒绝`);
+    }
+  }
+  pruneActions(room);
   // 点名进行中：离开者若为当前对象，立即点名下一人；否则其待点名位置自然跳过
   let rollcallMoved = false;
   if (room.rollcall) {
@@ -1693,6 +1866,83 @@ function handleCommand(ws, msg, room, pid, isHost) {
         `主持人开启新的发言配额周期：每人 ${d} 分钟（周期 ${room.quota.periodId}）`
       );
       return commit(room, { undoReason: 'quota_changed' });
+    }
+
+    case 'action_create': {
+      if (!guardVersion(ws, msg, room) || !requireHost(ws, room, isHost)) return;
+      const title = String(msg.title ?? '').trim().slice(0, ACTION_TITLE_MAX);
+      if (!title) {
+        return sendError(ws, '请填写行动项事项', 'NO_ACTION_TITLE', room);
+      }
+      const assigneeId = String(msg.assigneeId || '');
+      if (!room.participants.has(assigneeId)) {
+        return sendError(ws, '请从当前成员中选择负责人', 'NO_PARTICIPANT', room);
+      }
+      const deadline = Number(msg.deadline);
+      const now = Date.now();
+      if (!Number.isInteger(deadline) || deadline < now - ACTION_MIN_DEADLINE_MS) {
+        return sendError(ws, '截止时间须为不早于当前时刻的有效时间', 'BAD_DEADLINE', room);
+      }
+      if (deadline > now + ACTION_MAX_DEADLINE_MS) {
+        return sendError(ws, '截止时间最远为一年后', 'BAD_DEADLINE', room);
+      }
+      createAction(room, title, assigneeId, deadline);
+      return commit(room, { undoReason: 'action_changed' });
+    }
+
+    case 'action_accept':
+    case 'action_reject': {
+      if (!guardVersion(ws, msg, room)) return;
+      const action = room.actions.find((a) => a.id === String(msg.actionId || ''));
+      if (!action) return sendError(ws, '行动项不存在', 'NO_ACTION', room);
+      if (action.assigneeId !== pid) {
+        return sendError(ws, '只有负责人可以回应此行动项', 'ACTION_NOT_YOURS', room);
+      }
+      if (action.status !== 'pending') {
+        return sendError(ws, '该行动项已结束或已处理，不能再应答', 'ACTION_STATE', room);
+      }
+      if (msg.type === 'action_accept') {
+        transitionAction(room, action, 'accepted', pid, me.nick, `「${me.nick}」接受了行动项「${action.title}」`);
+      } else {
+        transitionAction(room, action, 'rejected', pid, me.nick, `「${me.nick}」拒绝了行动项「${action.title}」`);
+      }
+      return commit(room, { undoReason: 'action_changed' });
+    }
+
+    case 'action_done': {
+      if (!guardVersion(ws, msg, room)) return;
+      const action = room.actions.find((a) => a.id === String(msg.actionId || ''));
+      if (!action) return sendError(ws, '行动项不存在', 'NO_ACTION', room);
+      if (action.assigneeId !== pid) {
+        return sendError(ws, '只有负责人可以标记完成', 'ACTION_NOT_YOURS', room);
+      }
+      if (action.status !== 'in_progress') {
+        return sendError(
+          ws,
+          action.status === 'pending' ? '请先接受该行动项' : '当前状态不能标记完成',
+          'ACTION_STATE',
+          room
+        );
+      }
+      transitionAction(room, action, 'done', pid, me.nick, `「${me.nick}」标记行动项「${action.title}」已完成，等待主持人确认`);
+      return commit(room, { undoReason: 'action_changed' });
+    }
+
+    case 'action_confirm':
+    case 'action_return': {
+      if (!guardVersion(ws, msg, room) || !requireHost(ws, room, isHost)) return;
+      const action = room.actions.find((a) => a.id === String(msg.actionId || ''));
+      if (!action) return sendError(ws, '行动项不存在', 'NO_ACTION', room);
+      if (action.status !== 'review') {
+        return sendError(ws, '该行动项不在待确认状态', 'ACTION_STATE', room);
+      }
+      const nick = room.participants.get(action.assigneeId)?.nick ?? '已离开';
+      if (msg.type === 'action_confirm') {
+        transitionAction(room, action, 'confirmed', pid, me.nick, `主持人确认「${nick}」的行动项「${action.title}」已完成`);
+      } else {
+        transitionAction(room, action, 'returned', pid, me.nick, `主持人将「${nick}」的行动项「${action.title}」退回处理中`);
+      }
+      return commit(room, { undoReason: 'action_changed' });
     }
   }
 }

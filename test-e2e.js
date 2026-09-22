@@ -16,6 +16,8 @@ const ROLLCALL_TIMEOUT_MS = 800;
 const TOPIC_MIN_SECONDS = 1;
 // 测试用：把发言配额的 1「分钟」压缩为 50ms，便于快速验证额度耗尽自动结束
 const QUOTA_TIME_UNIT_MS = 50;
+// 测试用：行动项截止时间的宽容窗口拉长到 10 秒，便于构造「下发时已过期」场景
+const ACTION_MIN_DEADLINE_MS = 10000;
 let failures = 0;
 let serverProc = null;
 
@@ -1498,6 +1500,249 @@ async function main() {
     await h.close(); await g1b.close(); await g2.close();
   }
 
+  // ===========================================================================
+  // 行动项：指派 -> 接受/拒绝 -> 标记完成 -> 主持人确认/退回
+  // ===========================================================================
+  {
+    const created = await createRoom('行动主持');
+    const h = await hostJoin(created);
+    const g1 = await guestJoin(created.room, '行甲');
+    const g2 = await guestJoin(created.room, '行乙');
+    const id1 = g1.joined.you.id;
+    const id2 = g2.joined.you.id;
+    await waitStable(h, [g1, g2]);
+
+    const findAction = (c, id) => c.snapshot.actions.find((a) => a.id === id);
+
+    // 26a. 非主持人不能指派；标题为空 / 负责人不存在 / 截止时间非法均被拒且不改版本
+    g1.lastError = null;
+    await guestSend(h, g1, { type: 'action_create', title: '甲的事项', assigneeId: id1, deadline: Date.now() + 60000 });
+    await g1.waitFor((c) => c.lastError && c.lastError.code === 'FORBIDDEN');
+
+    for (const badTitle of ['', '   ']) {
+      const vBad = h.v;
+      h.lastError = null;
+      h.send({ type: 'action_create', version: h.v, title: badTitle, assigneeId: id1, deadline: Date.now() + 60000 });
+      await h.waitFor((c) => c.lastError && c.lastError.code === 'NO_ACTION_TITLE');
+      assert.strictEqual(h.v, vBad, '空标题不得改变版本');
+    }
+    const vBad2 = h.v;
+    h.lastError = null;
+    h.send({ type: 'action_create', version: h.v, title: '找不到负责人', assigneeId: 'p_nobody', deadline: Date.now() + 60000 });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'NO_PARTICIPANT');
+    assert.strictEqual(h.v, vBad2, '负责人不存在不得改变版本');
+
+    for (const badDeadline of [Date.now() - 60000, 'not-a-date', null]) {
+      const vBad = h.v;
+      h.lastError = null;
+      h.send({ type: 'action_create', version: h.v, title: '非法截止', assigneeId: id1, deadline: badDeadline });
+      await h.waitFor((c) => c.lastError && c.lastError.code === 'BAD_DEADLINE');
+      assert.strictEqual(h.v, vBad, '非法截止时间不得改变版本');
+    }
+
+    // 26b. 过期版本指派 -> STALE_VERSION + 最新快照（不创建行动项）
+    h.lastError = null;
+    h.send({ type: 'action_create', version: h.v - 1, title: '过期指派', assigneeId: id1, deadline: Date.now() + 60000 });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'STALE_VERSION');
+    assert.strictEqual(h.lastError.snapshot.version, h.snapshot.version);
+    assert.ok(!h.snapshot.actions.some((a) => a.title === '过期指派'), '过期命令不得创建行动项');
+
+    // 26c. 主持人向 g1 指派行动项：快照下发字段完整，初始 pending + 创建记录
+    const deadline1 = Date.now() + 3600 * 1000;
+    h.send({ type: 'action_create', version: h.v, title: '整理会议纪要', assigneeId: id1, deadline: deadline1 });
+    await h.waitFor((c) => c.snapshot.actions.some((a) => a.title === '整理会议纪要' && a.status === 'pending'));
+    let action = h.snapshot.actions.find((a) => a.title === '整理会议纪要');
+    assert.ok(/^ac_/.test(action.id), '行动项需有唯一 id');
+    assert.strictEqual(action.assigneeId, id1);
+    assert.strictEqual(action.assigneeNick, '行甲');
+    assert.strictEqual(action.hostId, created.participantId);
+    assert.strictEqual(action.deadline, deadline1);
+    assert.strictEqual(action.status, 'pending');
+    assert.strictEqual(action.history.length, 1);
+    assert.strictEqual(action.history[0].kind, 'created');
+    assert.ok(action.history[0].byNick, '创建记录需含主持人昵称快照');
+    assert.ok(h.snapshot.logs.some((l) => l.kind === 'action' && /指派/.test(l.text)));
+    const actionId1 = action.id;
+    await g1.waitFor((c) => c.snapshot.actions.some((a) => a.id === actionId1 && a.status === 'pending'));
+
+    // 26d. 越权：g2 不能接受指派给 g1 的行动项；状态错误：不能直接标记完成
+    g2.lastError = null;
+    await waitStable(h, [g2]);
+    g2.send({ type: 'action_accept', version: g2.v, actionId: actionId1 });
+    await g2.waitFor((c) => c.lastError && c.lastError.code === 'ACTION_NOT_YOURS');
+    g1.lastError = null;
+    await waitStable(h, [g1]);
+    g1.send({ type: 'action_done', version: g1.v, actionId: actionId1 });
+    await g1.waitFor((c) => c.lastError && c.lastError.code === 'ACTION_STATE');
+    // 主持人不能替负责人接受
+    h.lastError = null;
+    h.send({ type: 'action_accept', version: h.v, actionId: actionId1 });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'ACTION_NOT_YOURS');
+    assert.strictEqual(findAction(h, actionId1).status, 'pending', '被拒命令不得改变状态');
+
+    // 26e. 负责人接受：pending -> in_progress，历史追加
+    const vAccept = g1.v;
+    g1.send({ type: 'action_accept', version: g1.v, actionId: actionId1 });
+    await h.waitFor((c) => findAction(c, actionId1) && findAction(c, actionId1).status === 'in_progress');
+    assert.strictEqual(h.v, vAccept + 1);
+    action = findAction(h, actionId1);
+    assert.deepStrictEqual(action.history.map((x) => x.kind), ['created', 'accepted']);
+
+    // 26f. 重复接受（多端重复确认）：状态已不是 pending -> ACTION_STATE，不产生新版本
+    const vDup = h.v;
+    g1.lastError = null;
+    await waitStable(h, [g1]);
+    g1.send({ type: 'action_accept', version: g1.v, actionId: actionId1 });
+    await g1.waitFor((c) => c.lastError && c.lastError.code === 'ACTION_STATE');
+    assert.strictEqual(h.v, vDup, '重复接受不得产生新版本');
+    assert.strictEqual(findAction(h, actionId1).status, 'in_progress');
+
+    // 越权跳转：处理中时主持人不能直接确认完成（必须先待确认）
+    h.lastError = null;
+    h.send({ type: 'action_confirm', version: h.v, actionId: actionId1 });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'ACTION_STATE');
+    // 非负责人不能标记完成
+    g2.lastError = null;
+    await waitStable(h, [g2]);
+    g2.send({ type: 'action_done', version: g2.v, actionId: actionId1 });
+    await g2.waitFor((c) => c.lastError && c.lastError.code === 'ACTION_NOT_YOURS');
+    // 过期版本标记完成 -> STALE_VERSION + 最新快照
+    g1.lastError = null;
+    const staleV = g1.v;
+    g1.send({ type: 'action_done', version: g1.v - 1, actionId: actionId1 });
+    await g1.waitFor((c) => c.lastError && c.lastError.code === 'STALE_VERSION');
+    assert.strictEqual(g1.lastError.snapshot.version, h.snapshot.version);
+    assert.strictEqual(findAction(h, actionId1).status, 'in_progress');
+
+    // 26g. 负责人标记完成：in_progress -> review
+    g1.send({ type: 'action_done', version: staleV, actionId: actionId1 });
+    await h.waitFor((c) => findAction(c, actionId1) && findAction(c, actionId1).status === 'review');
+    assert.deepStrictEqual(findAction(h, actionId1).history.map((x) => x.kind),
+      ['created', 'accepted', 'done']);
+
+    // 26h. 负责人不能确认/退回（主持人专属）
+    g1.lastError = null;
+    await waitStable(h, [g1]);
+    g1.send({ type: 'action_confirm', version: g1.v, actionId: actionId1 });
+    await g1.waitFor((c) => c.lastError && c.lastError.code === 'FORBIDDEN');
+
+    // 26i. 主持人退回：review -> in_progress；负责人再次标记完成；主持人确认 -> completed
+    h.send({ type: 'action_return', version: h.v, actionId: actionId1 });
+    await h.waitFor((c) => findAction(c, actionId1) && findAction(c, actionId1).status === 'in_progress');
+    assert.deepStrictEqual(findAction(h, actionId1).history.map((x) => x.kind),
+      ['created', 'accepted', 'done', 'returned']);
+    await waitStable(h, [g1]);
+    g1.send({ type: 'action_done', version: g1.v, actionId: actionId1 });
+    await h.waitFor((c) => findAction(c, actionId1) && findAction(c, actionId1).status === 'review');
+    h.send({ type: 'action_confirm', version: h.v, actionId: actionId1 });
+    await h.waitFor((c) => findAction(c, actionId1) && findAction(c, actionId1).status === 'completed');
+    action = findAction(h, actionId1);
+    assert.ok(action.decidedAt > 0, '终态需记录 decidedAt');
+    assert.deepStrictEqual(action.history.map((x) => x.kind),
+      ['created', 'accepted', 'done', 'returned', 'done', 'confirmed']);
+    // 已完成后任何流转都被拒
+    h.lastError = null;
+    h.send({ type: 'action_confirm', version: h.v, actionId: actionId1 });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'ACTION_STATE');
+    g1.lastError = null;
+    await waitStable(h, [g1]);
+    g1.send({ type: 'action_done', version: g1.v, actionId: actionId1 });
+    await g1.waitFor((c) => c.lastError && c.lastError.code === 'ACTION_STATE');
+    // 不存在的 actionId -> NO_ACTION
+    g1.lastError = null;
+    g1.send({ type: 'action_done', version: g1.v, actionId: 'ac_not_exist' });
+    await g1.waitFor((c) => c.lastError && c.lastError.code === 'NO_ACTION');
+
+    // 26j. 拒绝流程：新建 -> 负责人拒绝 -> rejected（终态），不能再接受
+    h.send({ type: 'action_create', version: h.v, title: '预定场地', assigneeId: id2, deadline: Date.now() + 7200000 });
+    await h.waitFor((c) => c.snapshot.actions.some((a) => a.title === '预定场地' && a.status === 'pending'));
+    const actionId2 = h.snapshot.actions.find((a) => a.title === '预定场地').id;
+    await waitStable(h, [g2]);
+    g2.send({ type: 'action_reject', version: g2.v, actionId: actionId2 });
+    await h.waitFor((c) => findAction(c, actionId2) && findAction(c, actionId2).status === 'rejected');
+    assert.deepStrictEqual(findAction(h, actionId2).history.map((x) => x.kind), ['created', 'rejected']);
+    g2.lastError = null;
+    g2.send({ type: 'action_accept', version: g2.v, actionId: actionId2 });
+    await g2.waitFor((c) => c.lastError && c.lastError.code === 'ACTION_STATE');
+
+    // 26k. 截止时间只用于展示、不驱动状态：创建一个下发时即已过期的行动项
+    // （测试环境 ACTION_MIN_DEADLINE_MS=10000，允许 10 秒时钟宽容窗口），
+    // 状态保持 pending，负责人仍可正常接受
+    const pastDeadline = Date.now() - 5000;
+    h.send({ type: 'action_create', version: h.v, title: '已过期的事项', assigneeId: id1, deadline: pastDeadline });
+    await h.waitFor((c) => c.snapshot.actions.some((a) => a.title === '已过期的事项'));
+    const actionId3 = h.snapshot.actions.find((a) => a.title === '已过期的事项').id;
+    assert.strictEqual(findAction(h, actionId3).status, 'pending', '过期不自动流转');
+    assert.strictEqual(findAction(h, actionId3).deadline, pastDeadline);
+    await waitStable(h, [g1]);
+    g1.send({ type: 'action_accept', version: g1.v, actionId: actionId3 });
+    await h.waitFor((c) => findAction(c, actionId3) && findAction(c, actionId3).status === 'in_progress');
+
+    // 26l. 断线重连后行动项随快照恢复（分组、历史、截止时间一致）
+    await g1.close();
+    await h.waitFor((c) => {
+      const p = c.snapshot.participants.find((x) => x.id === id1);
+      return p && p.online === false;
+    });
+    const g1b = new Client();
+    await g1b.open();
+    g1b.send({ type: 'join', room: created.room, nick: '行甲', participantId: id1, secret: g1.joined.you.secret });
+    await g1b.waitFor((c) => c.joined && c.joined.you.id === id1);
+    const restored = g1b.snapshot.actions;
+    assert.ok(restored.some((a) => a.id === actionId1 && a.status === 'completed'), '已完成项重连恢复');
+    assert.ok(restored.some((a) => a.id === actionId2 && a.status === 'rejected'), '已拒绝项重连恢复');
+    const a3 = restored.find((a) => a.id === actionId3);
+    assert.ok(a3 && a3.status === 'in_progress', '处理中项重连恢复');
+    assert.strictEqual(a3.assigneeId, id1);
+    assert.ok(Array.isArray(a3.history) && a3.history.length >= 2, '状态变更记录随快照恢复');
+
+    // 26m. 负责人主动离开：待接受项自动拒绝；处理中/待确认项保留
+    h.send({ type: 'action_create', version: h.v, title: 'g2 待接受后离开', assigneeId: id2, deadline: Date.now() + 3600000 });
+    await h.waitFor((c) => c.snapshot.actions.some((a) => a.title === 'g2 待接受后离开' && a.status === 'pending'));
+    const actionId4 = h.snapshot.actions.find((a) => a.title === 'g2 待接受后离开').id;
+    // 另一项：指派 g2 -> 接受 -> 标记完成（待确认），随后 g2 离开，待确认项必须保留
+    h.send({ type: 'action_create', version: h.v, title: 'g2 待确认后离开', assigneeId: id2, deadline: Date.now() + 3600000 });
+    await h.waitFor((c) => c.snapshot.actions.some((a) => a.title === 'g2 待确认后离开' && a.status === 'pending'));
+    const actionId5 = h.snapshot.actions.find((a) => a.title === 'g2 待确认后离开').id;
+    await waitStable(h, [g2]);
+    g2.send({ type: 'action_accept', version: g2.v, actionId: actionId5 });
+    await h.waitFor((c) => findAction(c, actionId5) && findAction(c, actionId5).status === 'in_progress');
+    await waitStable(h, [g2]);
+    g2.send({ type: 'action_done', version: g2.v, actionId: actionId5 });
+    await h.waitFor((c) => findAction(c, actionId5) && findAction(c, actionId5).status === 'review');
+    // g2 主动离开
+    g2.send({ type: 'leave' });
+    await g2.close();
+    await h.waitFor((c) => !c.snapshot.participants.some((p) => p.id === id2));
+    assert.strictEqual(findAction(h, actionId4).status, 'rejected', '待接受项随离开自动拒绝');
+    const h4 = findAction(h, actionId4).history[findAction(h, actionId4).history.length - 1];
+    assert.strictEqual(h4.kind, 'auto_rejected');
+    assert.strictEqual(h4.by, null, '自动拒绝无操作者');
+    assert.strictEqual(findAction(h, actionId5).status, 'review', '待确认项不因离开消失');
+    assert.strictEqual(findAction(h, actionId5).assigneeNick, '已离开', '离开者昵称显示已离开');
+    // 主持人仍可确认离开者留下的待确认项
+    h.send({ type: 'action_confirm', version: h.v, actionId: actionId5 });
+    await h.waitFor((c) => findAction(c, actionId5) && findAction(c, actionId5).status === 'completed');
+
+    // 26n. 行动项变更使挂起的安全撤销失效（复用统一版本化机制）
+    const g3 = await guestJoin(created.room, '行丙');
+    const id3 = g3.joined.you.id;
+    await waitStable(h, [g3, g1b]);
+    // 至少两人排队，确保重排真正改变顺序（NO_CHANGE 不武装撤销）
+    await guestSend(h, g1b, { type: 'request_speak' });
+    await h.waitFor((c) => c.snapshot.order.length === 1);
+    await guestSend(h, g3, { type: 'request_speak' });
+    await h.waitFor((c) => c.snapshot.order.length === 2);
+    await hostCmd(h, { type: 'reorder', order: [id3, id1] });
+    assert.deepStrictEqual(h.snapshot.order, [id3, id1]);
+    await waitForUndo(h, (u) => u.status === 'available');
+    h.send({ type: 'action_create', version: h.v, title: '撤销联动', assigneeId: id3, deadline: Date.now() + 3600000 });
+    await h.waitFor((c) => c.snapshot.undo && c.snapshot.undo.status === 'invalid');
+    assert.strictEqual(h.snapshot.undo.reason, 'action_changed');
+
+    await h.close(); await g1b.close(); await g3.close();
+  }
+
   // 15. 房间不存在
   const ghost = new Client();
   await ghost.open();
@@ -1515,7 +1760,7 @@ async function main() {
 function startServer() {
   return new Promise((resolve, reject) => {
     serverProc = spawn(process.execPath, [path.join(__dirname, 'server.js')], {
-      env: { ...process.env, PORT: TEST_PORT, SPEAK_TIME_UNIT_MS: String(SPEAK_TIME_UNIT_MS), ROLLCALL_TIMEOUT_MS: String(ROLLCALL_TIMEOUT_MS), TOPIC_MIN_SECONDS: String(TOPIC_MIN_SECONDS), QUOTA_TIME_UNIT_MS: String(QUOTA_TIME_UNIT_MS) },
+      env: { ...process.env, PORT: TEST_PORT, SPEAK_TIME_UNIT_MS: String(SPEAK_TIME_UNIT_MS), ROLLCALL_TIMEOUT_MS: String(ROLLCALL_TIMEOUT_MS), TOPIC_MIN_SECONDS: String(TOPIC_MIN_SECONDS), QUOTA_TIME_UNIT_MS: String(QUOTA_TIME_UNIT_MS), ACTION_MIN_DEADLINE_MS: String(ACTION_MIN_DEADLINE_MS) },
       stdio: ['ignore', 'pipe', 'pipe']
     });
     let settled = false;

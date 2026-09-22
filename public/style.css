@@ -212,7 +212,7 @@ input[type="text"]:focus {
 .room-grid {
   display: grid;
   grid-template-columns: 1.35fr 1fr 1fr;
-  grid-template-rows: auto auto 1fr;
+  grid-template-rows: auto auto auto 1fr;
   gap: 18px;
   padding: 18px 22px 30px;
   max-width: 1600px;
@@ -234,8 +234,9 @@ input[type="text"]:focus {
 .panel-stage { grid-column: 1; grid-row: 1; }
 .panel-queue { grid-column: 2 / 4; grid-row: 1; }
 .panel-topic { grid-column: 1 / 4; grid-row: 2; }
-.panel-logs  { grid-column: 1 / 3; grid-row: 3; }
-.panel-people { grid-column: 3; grid-row: 3; }
+.panel-actions { grid-column: 1 / 4; grid-row: 3; }
+.panel-logs  { grid-column: 1 / 3; grid-row: 4; }
+.panel-people { grid-column: 3; grid-row: 4; }
 
 .panel-title {
   font-size: 18px;
@@ -1195,6 +1196,224 @@ body.role-participant #stage-actions-host { display: none; }
   to { transform: translateY(0); opacity: 1; }
 }
 
+/* ===== 行动项 ===== */
+.panel-actions {
+  gap: 10px;
+  max-height: 46vh;
+}
+
+.action-create-toggle {
+  margin-left: auto;
+}
+
+.action-create {
+  display: none;
+  flex-direction: column;
+  gap: 8px;
+  flex-shrink: 0;
+  padding: 12px 14px;
+  border: 1px solid rgba(34, 197, 94, 0.55);
+  background: rgba(34, 197, 94, 0.08);
+  border-radius: 12px;
+}
+
+body.role-host .action-create.host-only { display: flex; }
+.action-create.is-hidden { display: none !important; }
+.action-create input[type="text"] {
+  padding: 10px 14px;
+  font-size: 16px;
+}
+
+.action-create-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.action-field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 14px;
+  color: var(--text-dim);
+}
+
+.action-field select,
+.action-field input[type="datetime-local"] {
+  font-family: inherit;
+  font-size: 14px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  outline: none;
+  color-scheme: dark;
+}
+
+.action-field select:focus,
+.action-field input[type="datetime-local"]:focus {
+  border-color: var(--success);
+}
+
+.action-board {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-right: 4px;
+}
+
+.action-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.action-group-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text-dim);
+  background: var(--panel);
+  padding: 4px 2px;
+}
+
+.action-group-head .count { font-size: 12px; }
+
+.action-group-pending .action-group-head { color: var(--warning); }
+.action-group-progress .action-group-head { color: var(--primary); }
+.action-group-review .action-group-head { color: var(--accent); }
+.action-group-done .action-group-head { color: var(--text-dim); }
+
+.action-card {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel-2);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  animation: pop 0.2s ease;
+}
+
+.action-card.is-mine {
+  border-color: rgba(59, 130, 246, 0.55);
+  box-shadow: inset 3px 0 0 var(--primary);
+}
+
+.action-card.status-pending { border-left: 4px solid var(--warning); }
+.action-card.status-in_progress { border-left: 4px solid var(--primary); }
+.action-card.status-review { border-left: 4px solid var(--accent); }
+.action-card.status-completed { border-left: 4px solid var(--success); }
+.action-card.status-rejected { border-left: 4px solid var(--danger); opacity: 0.82; }
+
+.action-main {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.action-title {
+  font-size: 17px;
+  font-weight: 700;
+  word-break: break-all;
+  flex: 1;
+  min-width: 180px;
+}
+
+.status-completed .action-title { text-decoration: line-through; color: var(--text-dim); }
+
+.action-status-tag {
+  font-size: 12px;
+  font-weight: 700;
+  padding: 2px 10px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+.action-status-tag.pending { background: rgba(245, 158, 11, 0.18); color: var(--warning); border: 1px solid rgba(245, 158, 11, 0.55); }
+.action-status-tag.in_progress { background: rgba(59, 130, 246, 0.18); color: #93c5fd; border: 1px solid rgba(59, 130, 246, 0.55); }
+.action-status-tag.review { background: rgba(167, 139, 250, 0.18); color: var(--accent); border: 1px solid rgba(167, 139, 250, 0.55); }
+.action-status-tag.completed { background: rgba(34, 197, 94, 0.18); color: var(--success); border: 1px solid rgba(34, 197, 94, 0.55); }
+.action-status-tag.rejected { background: rgba(239, 68, 68, 0.18); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.55); }
+
+.action-meta {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+.action-assignee {
+  font-weight: 700;
+  color: var(--text);
+}
+
+.action-assignee.assignee-offline { color: var(--text-dim); font-weight: 400; }
+
+.action-deadline {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.action-deadline.overdue { color: var(--danger); font-weight: 700; }
+
+.action-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.action-history {
+  border-top: 1px dashed var(--border);
+  padding-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.action-history-item {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.action-history-item .ah-kind {
+  font-weight: 700;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.action-history-item .ah-time {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.action-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-dim);
+  font-size: 15px;
+  padding: 18px;
+  border: 1px dashed var(--border);
+  border-radius: 12px;
+}
+
 /* ===== 响应式：窄屏（手机 / 小窗口） ===== */
 @media (max-width: 1000px) {
   .room-grid {
@@ -1202,12 +1421,13 @@ body.role-participant #stage-actions-host { display: none; }
     grid-template-rows: none;
     height: auto;
   }
-  .panel-stage, .panel-queue, .panel-topic, .panel-logs, .panel-people {
+  .panel-stage, .panel-queue, .panel-topic, .panel-actions, .panel-logs, .panel-people {
     grid-column: 1;
     grid-row: auto;
   }
   .panel { min-height: 240px; }
-  .panel-topic { min-height: 0; }
+  .panel-topic, .panel-actions { min-height: 0; max-height: none; }
+  .action-board { max-height: none; overflow: visible; }
   .stage { min-height: 180px; }
   .tally-row { grid-template-columns: 64px 1fr 120px; }
 }

@@ -21,7 +21,10 @@ const state = {
   swapSeeded: false,
   swapStatus: new Map(),
   // 安全撤销：最近一次已展示的撤销状态（用于检测可用/失效/已撤销的跳变）
-  undoSeen: null
+  undoSeen: null,
+  // 行动项：actionId -> 最近已知状态（用于检测状态变化并弹出反馈）
+  actionSeeded: false,
+  actionStatus: new Map()
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -89,6 +92,15 @@ const els = {
   btnTopicFormCancel: $('#btn-topic-cancel-form'),
   topicCard: $('#topic-card'),
   topicHistory: $('#topic-history'),
+  // 行动项
+  btnActionNew: $('#btn-action-new'),
+  actionForm: $('#action-create-form'),
+  actionTitleInput: $('#action-title-input'),
+  actionAssignee: $('#action-assignee'),
+  actionDeadline: $('#action-deadline'),
+  btnActionFormCancel: $('#btn-action-cancel-form'),
+  actionBoard: $('#action-board'),
+  actionCount: $('#action-count'),
   toast: $('#toast-container')
 };
 
@@ -264,6 +276,8 @@ function enterRoom(creds) {
   state.swapSeeded = false;
   state.swapStatus = new Map();
   state.undoSeen = null;
+  state.actionSeeded = false;
+  state.actionStatus = new Map();
   state.intentionalClose = false;
   state.reconnectDelay = 500;
 
@@ -367,6 +381,8 @@ function handleMessage(msg) {
       state.swapSeeded = false;
       state.swapStatus = new Map();
       state.undoSeen = null;
+      state.actionSeeded = false;
+      state.actionStatus = new Map();
       // 持久化身份，供断线/刷新后恢复
       const creds = state.creds;
       creds.id = msg.you.id;
@@ -415,6 +431,7 @@ function applySnapshot(snap) {
   els.versionBadge.textContent = `v${snap.version}`;
   processSwaps(snap);
   processUndo(snap);
+  processActions(snap);
   render();
 }
 
@@ -536,6 +553,7 @@ function render() {
   renderUndoBar(snap);
   renderSwapBar(snap);
   renderTopic(snap);
+  renderActions(snap);
   renderLogs(snap);
   renderPeople(snap);
 }
@@ -696,6 +714,7 @@ if (!state.timerHandle) {
     updateRollcallCountdown();
     updateTopicCountdown();
     updateQuotaTick();
+    updateActionDeadlines();
   }, 250);
 }
 
@@ -1037,6 +1056,277 @@ function renderTopicHistory(snap) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 行动项：指派 / 接受拒绝 / 标记完成 / 确认退回；分组展示与状态变更反馈
+// ---------------------------------------------------------------------------
+
+const ACTION_STATUS_TEXT = {
+  pending: '待接受',
+  in_progress: '处理中',
+  review: '待确认',
+  completed: '已完成',
+  rejected: '已拒绝'
+};
+
+const ACTION_HISTORY_TEXT = {
+  created: '创建',
+  accepted: '接受',
+  rejected: '拒绝',
+  done: '标记完成',
+  confirmed: '确认完成',
+  returned: '退回处理中',
+  auto_rejected: '负责人离开，自动拒绝'
+};
+
+// 分组顺序与标题（第四组合并展示两种终态）
+const ACTION_GROUPS = [
+  { key: 'pending', cls: 'action-group-pending', title: '🕓 待接受', statuses: ['pending'] },
+  { key: 'in_progress', cls: 'action-group-progress', title: '🔧 处理中', statuses: ['in_progress'] },
+  { key: 'review', cls: 'action-group-review', title: '🔍 待确认', statuses: ['review'] },
+  { key: 'done', cls: 'action-group-done', title: '✅ 已完成 / 已拒绝', statuses: ['completed', 'rejected'] }
+];
+
+function isHostView() {
+  return !!(state.me && state.me.host);
+}
+
+/**
+ * 行动项状态变化反馈：仅在快照间检测到跳变时提示，首次快照（含重连）只播种，
+ * 避免断线重连后重复弹出确认类提示。
+ */
+function processActions(snap) {
+  const seen = new Set();
+  const myId = state.me ? state.me.id : null;
+  for (const a of snap.actions || []) {
+    seen.add(a.id);
+    const prev = state.actionStatus.get(a.id);
+    if (state.actionSeeded && (!prev || prev.status !== a.status)) {
+      const outcome = actionOutcomeToast(a, myId, prev ? prev.status : null);
+      if (outcome) toast(outcome[0], outcome[1]);
+    }
+    state.actionStatus.set(a.id, { status: a.status });
+  }
+  for (const id of [...state.actionStatus.keys()]) {
+    if (!seen.has(id)) state.actionStatus.delete(id);
+  }
+  state.actionSeeded = true;
+}
+
+function actionOutcomeToast(a, myId, prevStatus) {
+  const mine = a.assigneeId === myId;
+  const host = isHostView();
+  // 新建即分配给我
+  if (!prevStatus && a.status === 'pending' && mine) {
+    return [`主持人指派你负责行动项「${a.title}」，请接受或拒绝`, 'info'];
+  }
+  switch (a.status) {
+    case 'in_progress':
+      if (mine && prevStatus === 'pending') return ['已接受行动项', 'success'];
+      if (host && prevStatus === 'review') return [`「${a.assigneeNick}」的行动项「${a.title}」被退回处理中`, 'info'];
+      if (host && prevStatus === 'pending') return [`「${a.assigneeNick}」接受了行动项「${a.title}」`, 'success'];
+      return null;
+    case 'review':
+      if (mine) return ['已标记完成，等待主持人确认', 'success'];
+      if (host) return [`「${a.assigneeNick}」标记「${a.title}」已完成，待你确认`, 'info'];
+      return null;
+    case 'completed':
+      if (mine) return [`行动项「${a.title}」已被主持人确认完成`, 'success'];
+      return null;
+    case 'rejected':
+      if (host && prevStatus === 'pending') return [`「${a.assigneeNick}」拒绝了行动项「${a.title}」`, 'error'];
+      if (mine && prevStatus === 'pending') return ['已拒绝行动项', 'info'];
+      if (mine) return [`行动项「${a.title}」因你离开房间被自动拒绝`, 'info'];
+      return null;
+    default:
+      return null;
+  }
+}
+
+/** 截止时间文本：绝对日期时间 + 相对剩余/超期 */
+function formatDeadline(a) {
+  const d = new Date(a.deadline);
+  const pad = (n) => String(n).padStart(2, '0');
+  const abs = `${d.getMonth() + 1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  const remainMs = a.deadline - serverNow();
+  let rel;
+  if (a.status === 'completed') {
+    rel = '已完成';
+  } else if (a.status === 'rejected') {
+    rel = '已拒绝';
+  } else if (remainMs < 0) {
+    rel = `已超期 ${formatDuration(-remainMs)}`;
+  } else {
+    rel = `剩余 ${formatDuration(remainMs)}`;
+  }
+  return { abs, rel, overdue: remainMs < 0 && a.status !== 'completed' && a.status !== 'rejected' };
+}
+
+function renderActions(snap) {
+  const board = els.actionBoard;
+  board.textContent = '';
+  const actions = snap.actions || [];
+  const activeCount = actions.filter((a) => a.status === 'pending' || a.status === 'in_progress' || a.status === 'review').length;
+  els.actionCount.textContent = activeCount;
+
+  syncActionAssigneeOptions(snap);
+  syncActionFormVisibility(snap);
+
+  const myId = state.me ? state.me.id : null;
+  const host = isHostView();
+  let rendered = 0;
+
+  for (const group of ACTION_GROUPS) {
+    const items = actions.filter((a) => group.statuses.includes(a.status));
+    if (items.length === 0) continue;
+    rendered += items.length;
+
+    const g = document.createElement('div');
+    g.className = `action-group ${group.cls}`;
+    const head = document.createElement('div');
+    head.className = 'action-group-head';
+    head.innerHTML = `<span>${group.title}</span><span class="count">${items.length}</span>`;
+    g.appendChild(head);
+
+    for (const a of items) {
+      g.appendChild(renderActionCard(a, myId, host));
+    }
+    board.appendChild(g);
+  }
+
+  if (rendered === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'action-empty';
+    empty.textContent = host ? '暂无行动项，点右上角「＋ 指派行动项」开始' : '暂无行动项';
+    board.appendChild(empty);
+  }
+}
+
+function renderActionCard(a, myId, host) {
+  const card = document.createElement('div');
+  card.className = `action-card status-${a.status}${a.assigneeId === myId ? ' is-mine' : ''}`;
+  card.dataset.actionId = a.id;
+
+  const dl = formatDeadline(a);
+  const offline = a.assigneeOnline === false;
+  const mine = a.assigneeId === myId;
+
+  const main = document.createElement('div');
+  main.className = 'action-main';
+  main.innerHTML = `
+    <span class="action-status-tag ${a.status}">${ACTION_STATUS_TEXT[a.status] || a.status}</span>
+    <span class="action-title">${escapeHtml(a.title)}</span>
+  `;
+  card.appendChild(main);
+
+  const meta = document.createElement('div');
+  meta.className = 'action-meta';
+  meta.innerHTML = `
+    <span class="action-assignee${offline ? ' assignee-offline' : ''}" title="负责人">
+      👤 ${escapeHtml(a.assigneeNick)}${mine ? '（我）' : ''}${offline ? ' · 离线' : ''}
+    </span>
+    <span class="action-deadline${dl.overdue ? ' overdue' : ''}" data-action-deadline="${a.deadline}" data-action-status="${a.status}"
+          title="截止时间">⏰ ${escapeHtml(dl.abs)} · ${escapeHtml(dl.rel)}</span>
+  `;
+  card.appendChild(meta);
+
+  // 状态流转按钮：服务端还会再校验身份与状态，这里只按当前快照渲染
+  const actions = document.createElement('div');
+  actions.className = 'action-actions';
+  const addBtn = (act, label, cls) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = `btn btn-mini ${cls}`;
+    b.dataset.actionAct = act;
+    b.textContent = label;
+    actions.appendChild(b);
+  };
+  if (a.status === 'pending' && mine && !host) {
+    addBtn('accept', '✅ 接受', 'btn-primary');
+    addBtn('reject', '✕ 拒绝', 'btn-ghost');
+  } else if (a.status === 'in_progress' && mine && !host) {
+    addBtn('done', '✔ 标记完成', 'btn-primary');
+  } else if (a.status === 'review' && host) {
+    addBtn('confirm', '✅ 确认完成', 'btn-primary');
+    addBtn('return', '↩ 退回处理中', 'btn-ghost');
+  }
+  if (actions.children.length > 0) card.appendChild(actions);
+
+  // 最近状态变更记录（最新在最上）
+  const history = a.history || [];
+  if (history.length > 0) {
+    const hbox = document.createElement('div');
+    hbox.className = 'action-history';
+    for (let i = history.length - 1; i >= 0; i--) {
+      const h = history[i];
+      const item = document.createElement('div');
+      item.className = 'action-history-item';
+      item.innerHTML = `
+        <span class="ah-time">${formatTime(h.ts)}</span>
+        <span class="ah-kind">${escapeHtml(ACTION_HISTORY_TEXT[h.kind] || h.kind)}</span>
+        <span>${escapeHtml(h.byNick || '系统')}</span>
+      `;
+      hbox.appendChild(item);
+    }
+    card.appendChild(hbox);
+  }
+
+  return card;
+}
+
+/** 不重建 DOM 的前提下刷新截止时间的相对剩余/超期文案 */
+function updateActionDeadlines() {
+  const snap = state.snapshot;
+  if (!snap) return;
+  const byId = new Map((snap.actions || []).map((a) => [a.id, a]));
+  const els2 = els.actionBoard.querySelectorAll('[data-action-deadline]');
+  for (const el of els2) {
+    const a = byId.get(el.closest('.action-card').dataset.actionId);
+    if (!a) continue;
+    const dl = formatDeadline(a);
+    const d = new Date(a.deadline);
+    const pad = (n) => String(n).padStart(2, '0');
+    const abs = `${d.getMonth() + 1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    el.textContent = `⏰ ${abs} · ${dl.rel}`;
+    el.classList.toggle('overdue', dl.overdue);
+  }
+}
+
+/** 负责人下拉：主持人排第一，其余按加入顺序；保留当前选择 */
+function syncActionAssigneeOptions(snap) {
+  if (!state.me || !state.me.host) return;
+  const prev = els.actionAssignee.value;
+  const sorted = snap.participants.slice().sort((a, b) => {
+    if (a.id === snap.hostId) return -1;
+    if (b.id === snap.hostId) return 1;
+    return a.joinedAt - b.joinedAt;
+  });
+  const next = sorted.map((p) => p.id);
+  const same = next.length === els.actionAssignee.options.length &&
+    next.every((id, i) => els.actionAssignee.options[i].value === id);
+  if (same) return;
+  els.actionAssignee.textContent = '';
+  for (const p of sorted) {
+    const opt = document.createElement('option');
+    opt.value = p.id;
+    opt.textContent = p.id === snap.hostId ? `${p.nick}（主持人）` : p.nick;
+    els.actionAssignee.appendChild(opt);
+  }
+  if (prev && next.includes(prev)) els.actionAssignee.value = prev;
+}
+
+function syncActionFormVisibility() {
+  // 行动项表单不像议题那样互斥，指派后可继续指派；仅由「＋」按钮与「取消」控制
+}
+
+/** 把截止时间默认值设为下一个整点（本地时区），供 datetime-local 使用 */
+function setDefaultActionDeadline() {
+  const d = new Date(serverNow() + 60 * 60 * 1000);
+  d.setMinutes(0, 0, 0);
+  const pad = (n) => String(n).padStart(2, '0');
+  els.actionDeadline.value =
+    `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
 function renderLogs(snap) {
   els.logList.textContent = '';
   // 最新的在最上面
@@ -1188,6 +1478,56 @@ els.topicCard.addEventListener('click', (e) => {
     if (!confirm('确定提前结束当前议题并立即结算？')) return;
     sendCmd({ type: 'topic_end' });
   }
+});
+
+// ---------------------------------------------------------------------------
+// 行动项
+// ---------------------------------------------------------------------------
+
+els.btnActionNew.addEventListener('click', () => {
+  els.actionForm.classList.remove('is-hidden');
+  syncActionAssigneeOptions(state.snapshot);
+  setDefaultActionDeadline();
+  els.actionTitleInput.focus();
+});
+
+els.btnActionFormCancel.addEventListener('click', () => {
+  els.actionForm.classList.add('is-hidden');
+});
+
+els.actionForm.addEventListener('submit', (e) => {
+  e.preventDefault();
+  const title = els.actionTitleInput.value.trim();
+  if (!title) return toast('请填写行动事项', 'error');
+  const assigneeId = els.actionAssignee.value;
+  if (!assigneeId) return toast('请选择负责人', 'error');
+  const deadlineMs = new Date(els.actionDeadline.value).getTime();
+  if (!Number.isFinite(deadlineMs)) {
+    return toast('请选择有效的截止时间', 'error');
+  }
+  if (deadlineMs <= serverNow()) {
+    return toast('截止时间不能早于当前时间', 'error');
+  }
+  sendCmd({ type: 'action_create', title, assigneeId, deadline: deadlineMs });
+  els.actionTitleInput.value = '';
+  // 保留负责人与截止时间，便于连续指派；表单不收起
+});
+
+// 行动项卡片：接受 / 拒绝 / 标记完成 / 确认完成 / 退回（均走版本守卫）
+els.actionBoard.addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-action-act]');
+  if (!btn || btn.disabled) return;
+  const card = e.target.closest('.action-card');
+  if (!card) return;
+  const actionId = card.dataset.actionId;
+  const act = btn.dataset.actionAct;
+  const confirmMap = {
+    reject: '确定拒绝该行动项？',
+    confirm: '确定确认该行动项已完成？',
+    return: '确定退回让负责人继续处理？'
+  };
+  if (confirmMap[act] && !confirm(confirmMap[act])) return;
+  sendCmd({ type: `action_${act}`, actionId });
 });
 
 // 安全撤销条：撤销最近一次主持人操作（版本冲突仍走 STALE_VERSION 流程）
