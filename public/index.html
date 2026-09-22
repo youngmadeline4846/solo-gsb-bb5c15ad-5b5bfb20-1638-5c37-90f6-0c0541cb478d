@@ -162,6 +162,57 @@
         <div class="topic-history" id="topic-history"></div>
       </div>
 
+      <!-- 行动项 -->
+      <div class="panel panel-tasks">
+        <div class="panel-title">
+          ✅ 行动项 <span class="count" id="task-count">0</span>
+          <button class="btn btn-primary btn-mini host-only task-create-toggle" id="btn-task-new"
+                  type="button" title="从当前成员中指定负责人，填写事项与截止时间">＋ 新建行动项</button>
+        </div>
+
+        <!-- 主持人：创建行动项 -->
+        <form class="task-create host-only is-hidden" id="task-create-form">
+          <input type="text" id="task-title-input" maxlength="120"
+                 placeholder="事项内容（如：整理会议纪要并同步到群里）" autocomplete="off" />
+          <div class="task-create-row">
+            <label class="duration-picker" title="从当前成员中指定负责人">
+              负责人
+              <select id="task-assignee"></select>
+            </label>
+            <label class="duration-picker" title="行动项截止时间">
+              截止
+              <input type="datetime-local" id="task-deadline" />
+            </label>
+            <button class="btn btn-primary btn-mini" type="submit">创建行动项</button>
+            <button class="btn btn-ghost btn-mini" id="btn-task-cancel-form" type="button">取消</button>
+          </div>
+        </form>
+
+        <!-- 分组展示：待接受 / 处理中 / 待确认 / 已完成·已拒绝 -->
+        <div class="task-groups" id="task-groups">
+          <div class="task-group" data-group="pending">
+            <div class="task-group-title">待接受 <span class="count" data-task-count="pending">0</span></div>
+            <ul class="task-list" data-task-list="pending"></ul>
+            <div class="task-empty" data-task-empty="pending">暂无待接受的行动项</div>
+          </div>
+          <div class="task-group" data-group="active">
+            <div class="task-group-title">处理中 <span class="count" data-task-count="active">0</span></div>
+            <ul class="task-list" data-task-list="active"></ul>
+            <div class="task-empty" data-task-empty="active">暂无处理中的行动项</div>
+          </div>
+          <div class="task-group" data-group="review">
+            <div class="task-group-title">待确认 <span class="count" data-task-count="review">0</span></div>
+            <ul class="task-list" data-task-list="review"></ul>
+            <div class="task-empty" data-task-empty="review">暂无待确认的行动项</div>
+          </div>
+          <div class="task-group" data-group="closed">
+            <div class="task-group-title">已完成 / 已拒绝 <span class="count" data-task-count="closed">0</span></div>
+            <ul class="task-list" data-task-list="closed"></ul>
+            <div class="task-empty" data-task-empty="closed">暂无已完结的行动项</div>
+          </div>
+        </div>
+      </div>
+
       <!-- 右侧：记录 + 成员 -->
       <div class="panel panel-side panel-logs">
         <div class="panel-title">

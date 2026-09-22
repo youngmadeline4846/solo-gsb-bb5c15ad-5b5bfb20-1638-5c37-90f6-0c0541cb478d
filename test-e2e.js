@@ -1498,6 +1498,194 @@ async function main() {
     await h.close(); await g1b.close(); await g2.close();
   }
 
+  // ===========================================================================
+  // 行动项（状态机：待接受 -> 处理中 -> 待确认 -> 已完成 / 已拒绝）
+  // ===========================================================================
+  {
+    const created = await createRoom('行动主持');
+    const h = await hostJoin(created);
+    const g1 = await guestJoin(created.room, '行甲');
+    const g2 = await guestJoin(created.room, '行乙');
+    const id1 = g1.joined.you.id;
+    const id2 = g2.joined.you.id;
+    await waitStable(h, [g1, g2]);
+
+    // 26a. 非主持人不能创建；空标题 / 非法截止时间 / 不存在的负责人 / 过期版本均被拒
+    g1.lastError = null;
+    await guestSend(h, g1, { type: 'task_create', participantId: id1, title: '越权', deadline: Date.now() + 3600000 });
+    await g1.waitFor((c) => c.lastError && c.lastError.code === 'FORBIDDEN');
+    assert.strictEqual((h.snapshot.tasks || []).length, 0, '越权创建不得产生行动项');
+
+    const vBad0 = h.v;
+    h.lastError = null;
+    h.send({ type: 'task_create', version: h.v, participantId: id1, title: '   ', deadline: Date.now() + 3600000 });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'NO_TASK_TITLE');
+    assert.strictEqual(h.v, vBad0, '空标题不得改变版本');
+
+    for (const bad of [Date.now() - 3600000, Date.now() + 400 * 24 * 3600 * 1000, 'abc', null]) {
+      const vBad = h.v;
+      h.lastError = null;
+      h.send({ type: 'task_create', version: h.v, participantId: id1, title: '非法截止', deadline: bad });
+      await h.waitFor((c) => c.lastError && c.lastError.code === 'BAD_DEADLINE');
+      assert.strictEqual(h.v, vBad, '非法截止时间不得改变版本');
+    }
+
+    h.lastError = null;
+    h.send({ type: 'task_create', version: h.v, participantId: 'p_ghost', title: '幽灵负责', deadline: Date.now() + 3600000 });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'NO_PARTICIPANT');
+
+    h.lastError = null;
+    h.send({ type: 'task_create', version: h.v - 1, participantId: id1, title: '过期命令', deadline: Date.now() + 3600000 });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'STALE_VERSION');
+    assert.strictEqual(h.lastError.snapshot.version, h.snapshot.version, '过期命令必须返回最新快照');
+    assert.strictEqual((h.snapshot.tasks || []).length, 0, '过期命令不得创建行动项');
+
+    // 26b. 主持人创建：快照下发行动项（待接受），含首条状态变更记录与操作日志
+    const dl = Date.now() + 3600000;
+    h.send({ type: 'task_create', version: h.v, participantId: id1, title: '整理会议纪要', deadline: dl });
+    await h.waitFor((c) => c.snapshot.tasks && c.snapshot.tasks.length === 1);
+    const task1 = h.snapshot.tasks[0];
+    assert.ok(/^tk_/.test(task1.id), '快照需包含 taskId');
+    assert.strictEqual(task1.status, 'pending');
+    assert.strictEqual(task1.title, '整理会议纪要');
+    assert.strictEqual(task1.assigneeId, id1);
+    assert.strictEqual(task1.assigneeNick, '行甲');
+    assert.strictEqual(task1.deadline, dl);
+    assert.ok(Array.isArray(task1.history) && task1.history.length === 1, '创建即写入首条状态变更记录');
+    assert.strictEqual(task1.history[0].from, null);
+    assert.strictEqual(task1.history[0].to, 'pending');
+    assert.ok(h.snapshot.logs.some((l) => l.kind === 'task' && /创建行动项/.test(l.text)));
+    const taskId1 = task1.id;
+
+    // 26c. 身份校验：非负责人（含主持人与其他成员）不能接受；不存在的任务 -> NO_TASK
+    g2.lastError = null;
+    await guestSend(h, g2, { type: 'task_accept', taskId: taskId1 });
+    await g2.waitFor((c) => c.lastError && c.lastError.code === 'TASK_NOT_YOURS');
+    h.lastError = null;
+    h.send({ type: 'task_accept', version: h.v, taskId: taskId1 });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'TASK_NOT_YOURS');
+    g1.lastError = null;
+    await guestSend(h, g1, { type: 'task_accept', taskId: 'tk_none' });
+    await g1.waitFor((c) => c.lastError && c.lastError.code === 'NO_TASK');
+    assert.strictEqual(h.snapshot.tasks[0].status, 'pending', '被拒命令不得改变状态');
+
+    // 负责人接受 -> 处理中，状态变更记录追加
+    await guestSend(h, g1, { type: 'task_accept', taskId: taskId1 });
+    await h.waitFor((c) => c.snapshot.tasks[0].status === 'active');
+    assert.strictEqual(h.snapshot.tasks[0].history.length, 2);
+    assert.strictEqual(h.snapshot.tasks[0].history[1].from, 'pending');
+    assert.strictEqual(h.snapshot.tasks[0].history[1].to, 'active');
+    assert.strictEqual(h.snapshot.tasks[0].history[1].by, id1);
+
+    // 26d. 状态校验：重复接受 / 处理中重复标记完成的前置状态不符 -> BAD_TASK_STATE（附最新快照）
+    g1.lastError = null;
+    await guestSend(h, g1, { type: 'task_accept', taskId: taskId1 });
+    await g1.waitFor((c) => c.lastError && c.lastError.code === 'BAD_TASK_STATE');
+    assert.strictEqual(g1.lastError.snapshot.tasks[0].status, 'active', '错误应附带最新快照');
+
+    // 负责人标记完成 -> 待确认
+    await guestSend(h, g1, { type: 'task_complete', taskId: taskId1 });
+    await h.waitFor((c) => c.snapshot.tasks[0].status === 'review');
+    assert.ok(h.snapshot.logs.some((l) => l.kind === 'task' && /标记为完成/.test(l.text)));
+
+    // 待确认状态下负责人重复标记 -> BAD_TASK_STATE（防止多端重复提交）
+    g1.lastError = null;
+    await guestSend(h, g1, { type: 'task_complete', taskId: taskId1 });
+    await g1.waitFor((c) => c.lastError && c.lastError.code === 'BAD_TASK_STATE');
+
+    // 26e. 主持人退回处理中 -> 处理中；再次完成 -> 待确认；确认完成 -> 已完成
+    h.send({ type: 'task_return', version: h.v, taskId: taskId1 });
+    await h.waitFor((c) => c.snapshot.tasks[0].status === 'active');
+    assert.ok(h.snapshot.logs.some((l) => l.kind === 'task' && /退回处理中/.test(l.text)));
+
+    // 非主持人不能退回 / 确认
+    g1.lastError = null;
+    await guestSend(h, g1, { type: 'task_return', taskId: taskId1 });
+    await g1.waitFor((c) => c.lastError && c.lastError.code === 'FORBIDDEN');
+    g1.lastError = null;
+    await guestSend(h, g1, { type: 'task_confirm', taskId: taskId1 });
+    await g1.waitFor((c) => c.lastError && c.lastError.code === 'FORBIDDEN');
+
+    // 主持人不能确认非待确认状态（处理中直接确认属于越权跳转）
+    h.lastError = null;
+    h.send({ type: 'task_confirm', version: h.v, taskId: taskId1 });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'BAD_TASK_STATE');
+    assert.strictEqual(h.snapshot.tasks[0].status, 'active');
+
+    await guestSend(h, g1, { type: 'task_complete', taskId: taskId1 });
+    await h.waitFor((c) => c.snapshot.tasks[0].status === 'review');
+    h.send({ type: 'task_confirm', version: h.v, taskId: taskId1 });
+    await h.waitFor((c) => c.snapshot.tasks[0].status === 'done');
+    const hist1 = h.snapshot.tasks[0].history;
+    assert.deepStrictEqual(
+      hist1.map((x) => x.to),
+      ['pending', 'active', 'review', 'active', 'review', 'done'],
+      '完整状态流转记录应保留'
+    );
+    assert.ok(hist1.every((x) => x.ts > 0 && x.by && x.byNick), '每条记录含时间与操作者');
+
+    // 已完成后任何流转都被拒（终态）
+    h.lastError = null;
+    h.send({ type: 'task_return', version: h.v, taskId: taskId1 });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'BAD_TASK_STATE');
+    g1.lastError = null;
+    await guestSend(h, g1, { type: 'task_accept', taskId: taskId1 });
+    await g1.waitFor((c) => c.lastError && c.lastError.code === 'BAD_TASK_STATE');
+    assert.strictEqual(h.snapshot.tasks[0].status, 'done');
+
+    // 26f. 拒绝流程：创建 -> 负责人拒绝 -> 已拒绝（终态，不可再接受）
+    h.send({ type: 'task_create', version: h.v, participantId: id2, title: '准备茶水', deadline: Date.now() + 3600000 });
+    await h.waitFor((c) => c.snapshot.tasks.length === 2);
+    const task2 = h.snapshot.tasks.find((t) => t.title === '准备茶水');
+    assert.strictEqual(task2.assigneeId, id2);
+    await guestSend(h, g2, { type: 'task_reject', taskId: task2.id });
+    await h.waitFor((c) => c.snapshot.tasks.find((t) => t.id === task2.id).status === 'rejected');
+    assert.ok(h.snapshot.logs.some((l) => l.kind === 'task' && /拒绝了行动项/.test(l.text)));
+    g2.lastError = null;
+    await guestSend(h, g2, { type: 'task_accept', taskId: task2.id });
+    await g2.waitFor((c) => c.lastError && c.lastError.code === 'BAD_TASK_STATE');
+    // 负责人也不能标记完成一个未接受的任务
+    g2.lastError = null;
+    await guestSend(h, g2, { type: 'task_complete', taskId: task2.id });
+    await g2.waitFor((c) => c.lastError && c.lastError.code === 'BAD_TASK_STATE');
+
+    // 26g. 断线重连后行动项状态与变更记录完整恢复
+    await g1.close();
+    await h.waitFor((c) => {
+      const p = c.snapshot.participants.find((x) => x.id === id1);
+      return p && p.online === false;
+    });
+    const g1b = new Client();
+    await g1b.open();
+    g1b.send({ type: 'join', room: created.room, nick: '行甲', participantId: id1, secret: g1.joined.you.secret });
+    await g1b.waitFor((c) => c.joined && c.joined.you.id === id1);
+    const t1r = g1b.snapshot.tasks.find((t) => t.id === taskId1);
+    assert.ok(t1r && t1r.status === 'done', '重连后行动项状态恢复');
+    assert.strictEqual(t1r.history.length, 6, '重连后状态变更记录保留');
+    assert.strictEqual(t1r.deadline, dl, '重连后截止时间不变');
+    const t2r = g1b.snapshot.tasks.find((t) => t.id === task2.id);
+    assert.ok(t2r && t2r.status === 'rejected', '重连后已拒绝状态恢复');
+
+    // 26h. 过期命令返回最新快照（多端重复确认防护）：主持人用旧版本确认
+    h.lastError = null;
+    h.send({ type: 'task_confirm', version: h.v - 1, taskId: taskId1 });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'STALE_VERSION');
+    assert.strictEqual(h.lastError.snapshot.version, h.snapshot.version);
+    assert.strictEqual(h.snapshot.tasks.find((t) => t.id === taskId1).status, 'done', '过期命令不得改变状态');
+
+    // 26i. 行动项变更使挂起的安全撤销失效（reason = task_changed）
+    await guestSend(h, g1b, { type: 'request_speak' });
+    await h.waitFor((c) => c.snapshot.order.length === 1);
+    await hostCmd(h, { type: 'start_speaking', participantId: id1 });
+    await waitForUndo(h, (u) => u.status === 'available' && u.op === 'start_speaking');
+    h.send({ type: 'task_create', version: h.v, participantId: id2, title: '写周报', deadline: Date.now() + 3600000 });
+    await h.waitFor((c) => c.snapshot.undo && c.snapshot.undo.status === 'invalid');
+    assert.strictEqual(h.snapshot.undo.reason, 'task_changed');
+    await hostCmd(h, { type: 'end_speaking' });
+
+    await h.close(); await g1b.close(); await g2.close();
+  }
+
   // 15. 房间不存在
   const ghost = new Client();
   await ghost.open();

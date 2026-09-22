@@ -20,6 +20,9 @@ const state = {
   // 换位邀请：swapId -> 最近已知状态（用于检测状态变化并弹出反馈）
   swapSeeded: false,
   swapStatus: new Map(),
+  // 行动项：taskId -> 最近已知状态（用于检测状态变化并弹出反馈）
+  taskSeeded: false,
+  taskStatus: new Map(),
   // 安全撤销：最近一次已展示的撤销状态（用于检测可用/失效/已撤销的跳变）
   undoSeen: null
 };
@@ -89,6 +92,15 @@ const els = {
   btnTopicFormCancel: $('#btn-topic-cancel-form'),
   topicCard: $('#topic-card'),
   topicHistory: $('#topic-history'),
+  // 行动项
+  btnTaskNew: $('#btn-task-new'),
+  taskForm: $('#task-create-form'),
+  taskTitleInput: $('#task-title-input'),
+  taskAssignee: $('#task-assignee'),
+  taskDeadline: $('#task-deadline'),
+  btnTaskFormCancel: $('#btn-task-cancel-form'),
+  taskCount: $('#task-count'),
+  taskGroups: $('#task-groups'),
   toast: $('#toast-container')
 };
 
@@ -153,6 +165,12 @@ function escapeHtml(s) {
 
 function serverNow() {
   return Date.now() + state.clockOffset;
+}
+
+/** datetime-local 输入框所需的本地时间格式（YYYY-MM-DDTHH:mm） */
+function toLocalInputValue(ts) {
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}T${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
 }
 
 // 限时时长选项：1～30 分钟（「不限时」为默认项，见 index.html）
@@ -263,6 +281,8 @@ function enterRoom(creds) {
   state.version = 0;
   state.swapSeeded = false;
   state.swapStatus = new Map();
+  state.taskSeeded = false;
+  state.taskStatus = new Map();
   state.undoSeen = null;
   state.intentionalClose = false;
   state.reconnectDelay = 500;
@@ -366,6 +386,8 @@ function handleMessage(msg) {
       // 首次快照只播种状态，不把重连前已存在的邀请/撤销状态当成新变化弹提示
       state.swapSeeded = false;
       state.swapStatus = new Map();
+      state.taskSeeded = false;
+      state.taskStatus = new Map();
       state.undoSeen = null;
       // 持久化身份，供断线/刷新后恢复
       const creds = state.creds;
@@ -415,6 +437,7 @@ function applySnapshot(snap) {
   els.versionBadge.textContent = `v${snap.version}`;
   processSwaps(snap);
   processUndo(snap);
+  processTasks(snap);
   render();
 }
 
@@ -536,6 +559,7 @@ function render() {
   renderUndoBar(snap);
   renderSwapBar(snap);
   renderTopic(snap);
+  renderTasks(snap);
   renderLogs(snap);
   renderPeople(snap);
 }
@@ -696,6 +720,7 @@ if (!state.timerHandle) {
     updateRollcallCountdown();
     updateTopicCountdown();
     updateQuotaTick();
+    updateTaskTick();
   }, 250);
 }
 
@@ -1036,6 +1061,249 @@ function renderTopicHistory(snap) {
     box.appendChild(item);
   }
 }
+
+// ---------------------------------------------------------------------------
+// 行动项：分组看板（待接受 / 处理中 / 待确认 / 已完成·已拒绝）与状态流转
+// ---------------------------------------------------------------------------
+
+const TASK_STATUS_TEXT = {
+  pending: '待接受',
+  active: '处理中',
+  review: '待确认',
+  done: '已完成',
+  rejected: '已拒绝'
+};
+
+// 看板分组：key 对应 index.html 中的 data-group / data-task-list
+const TASK_GROUPS = [
+  { key: 'pending', statuses: ['pending'] },
+  { key: 'active', statuses: ['active'] },
+  { key: 'review', statuses: ['review'] },
+  { key: 'closed', statuses: ['done', 'rejected'] }
+];
+
+/** 状态变更记录 -> 可读文案（按 from -> to 区分「接受」与「退回」） */
+function taskHistoryText(h) {
+  if (h.to === 'pending') return '创建了行动项';
+  if (h.to === 'active') return h.from === 'review' ? '退回处理中' : '接受了，开始处理';
+  if (h.to === 'review') return '标记完成，待确认';
+  if (h.to === 'done') return '确认完成';
+  if (h.to === 'rejected') return '拒绝了';
+  return '状态变更';
+}
+
+function formatDeadline(ts) {
+  const d = new Date(ts);
+  return `${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+
+/** 剩余 / 逾期时长的人性化文本（按服务端校准时钟计算） */
+function taskRemainText(deadline) {
+  const diff = deadline - serverNow();
+  const abs = Math.abs(diff);
+  const days = Math.floor(abs / 86400000);
+  const hours = Math.floor((abs % 86400000) / 3600000);
+  const mins = Math.floor((abs % 3600000) / 60000);
+  let txt;
+  if (days > 0) txt = `${days} 天 ${hours} 小时`;
+  else if (hours > 0) txt = `${hours} 小时 ${mins} 分`;
+  else txt = `${Math.max(mins, 1)} 分钟`;
+  return diff >= 0 ? `剩 ${txt}` : `已逾期 ${txt}`;
+}
+
+/** 状态变化反馈：与本人相关（我是负责人或主持人）的流转弹提示 */
+function taskTransitionToast(snap, task, prevStatus) {
+  const me = state.me;
+  if (!me) return null;
+  const isAssignee = task.assigneeId === me.id;
+  if (!prevStatus && task.status === 'pending' && isAssignee) {
+    return [`主持人给你指派了行动项「${task.title}」`, 'info'];
+  }
+  if (task.status === 'active' && prevStatus === 'pending' && me.host) {
+    return [`「${task.assigneeNick}」接受了行动项「${task.title}」`, 'success'];
+  }
+  if (task.status === 'rejected' && me.host) {
+    return [`「${task.assigneeNick}」拒绝了行动项「${task.title}」`, 'error'];
+  }
+  if (task.status === 'review' && me.host) {
+    return [`「${task.assigneeNick}」标记完成「${task.title}」，待你确认`, 'info'];
+  }
+  if (task.status === 'done' && isAssignee) {
+    return [`主持人已确认「${task.title}」完成`, 'success'];
+  }
+  if (task.status === 'active' && prevStatus === 'review' && isAssignee) {
+    return [`主持人将「${task.title}」退回处理中`, 'error'];
+  }
+  return null;
+}
+
+function processTasks(snap) {
+  const seen = new Set();
+  for (const task of snap.tasks || []) {
+    seen.add(task.id);
+    const prev = state.taskStatus.get(task.id);
+    if (state.taskSeeded && (!prev || prev.status !== task.status)) {
+      const outcome = taskTransitionToast(snap, task, prev ? prev.status : null);
+      if (outcome) toast(outcome[0], outcome[1]);
+    }
+    state.taskStatus.set(task.id, { status: task.status });
+  }
+  // 清理已从快照消失（滚动淘汰）的本地记录
+  for (const id of [...state.taskStatus.keys()]) {
+    if (!seen.has(id)) state.taskStatus.delete(id);
+  }
+  state.taskSeeded = true;
+}
+
+/** 负责人下拉框：跟随成员列表重建，保留当前选择（默认选自己） */
+function syncTaskAssigneeOptions(snap) {
+  const sel = els.taskAssignee;
+  const prev = sel.value;
+  sel.textContent = '';
+  const sorted = snap.participants.slice().sort((a, b) => a.joinedAt - b.joinedAt);
+  for (const p of sorted) {
+    const opt = document.createElement('option');
+    opt.value = p.id;
+    opt.textContent =
+      `${p.nick}${p.id === snap.hostId ? '（主持人）' : ''}${p.online ? '' : '（离线）'}`;
+    sel.appendChild(opt);
+  }
+  const values = [...sel.options].map((o) => o.value);
+  if (prev && values.includes(prev)) sel.value = prev;
+  else if (state.me && values.includes(state.me.id)) sel.value = state.me.id;
+}
+
+/**
+ * 行动项看板：按 待接受 / 处理中 / 待确认 / 已完成·已拒绝 分组渲染。
+ * 未完结组按截止时间升序（最紧急在前），已完结组按最近更新降序；
+ * 每项卡片展示负责人、截止时间与最近一条状态变更记录，
+ * 并按「当前状态 + 我的身份」渲染可执行操作（服务端仍会二次校验）。
+ */
+function renderTasks(snap) {
+  const tasks = snap.tasks || [];
+  const openCount = tasks.filter(
+    (t) => t.status === 'pending' || t.status === 'active' || t.status === 'review'
+  ).length;
+  els.taskCount.textContent = openCount;
+  syncTaskAssigneeOptions(snap);
+  const pmap = participantMap(snap);
+
+  for (const g of TASK_GROUPS) {
+    const listEl = els.taskGroups.querySelector(`[data-task-list="${g.key}"]`);
+    const emptyEl = els.taskGroups.querySelector(`[data-task-empty="${g.key}"]`);
+    const countEl = els.taskGroups.querySelector(`[data-task-count="${g.key}"]`);
+    const items = tasks.filter((t) => g.statuses.includes(t.status));
+    items.sort((a, b) => (g.key === 'closed' ? b.updatedAt - a.updatedAt : a.deadline - b.deadline));
+    countEl.textContent = items.length;
+    emptyEl.classList.toggle('hidden', items.length > 0);
+    listEl.textContent = '';
+    for (const t of items) {
+      listEl.appendChild(taskCard(t, pmap, g.key === 'closed'));
+    }
+  }
+  updateTaskTick();
+}
+
+function taskCard(t, pmap, closed) {
+  const me = state.me;
+  const isAssignee = !!(me && me.id === t.assigneeId);
+  const isHost = !!(me && me.host);
+  const assignee = pmap.get(t.assigneeId);
+  const offline = !assignee || !assignee.online;
+
+  // 可执行操作：负责人接受/拒绝（待接受）、标记完成（处理中）；主持人确认/退回（待确认）
+  let actions = '';
+  if (t.status === 'pending' && isAssignee) {
+    actions = `
+      <div class="task-actions">
+        <button class="btn btn-primary btn-mini" data-task-act="accept" data-task-id="${t.id}">接受</button>
+        <button class="btn btn-ghost btn-mini" data-task-act="reject" data-task-id="${t.id}">拒绝</button>
+      </div>`;
+  } else if (t.status === 'active' && isAssignee) {
+    actions = `
+      <div class="task-actions">
+        <button class="btn btn-primary btn-mini" data-task-act="complete" data-task-id="${t.id}">✔ 标记完成</button>
+      </div>`;
+  } else if (t.status === 'review' && isHost) {
+    actions = `
+      <div class="task-actions">
+        <button class="btn btn-primary btn-mini" data-task-act="confirm" data-task-id="${t.id}">✅ 确认完成</button>
+        <button class="btn btn-ghost btn-mini" data-task-act="return" data-task-id="${t.id}">↩ 退回处理中</button>
+      </div>`;
+  }
+
+  const last = t.history && t.history.length ? t.history[t.history.length - 1] : null;
+  const li = document.createElement('li');
+  li.className = `task-card st-${t.status}`;
+  li.innerHTML = `
+    <div class="task-card-head">
+      <span class="task-status-tag">${TASK_STATUS_TEXT[t.status] || t.status}</span>
+      <span class="task-title">${escapeHtml(t.title)}</span>
+    </div>
+    <div class="task-meta">
+      <span>负责人：<b>${escapeHtml(t.assigneeNick)}</b></span>
+      ${isAssignee ? '<span class="me-tag">我</span>' : ''}
+      ${offline ? '<span class="offline-tag">离线</span>' : ''}
+    </div>
+    <div class="task-meta">
+      <span>截止 ${formatDeadline(t.deadline)}</span>
+      ${closed ? '' : `<span class="task-remain" data-deadline="${t.deadline}"></span>`}
+    </div>
+    ${last ? `<div class="task-history-line">${formatTime(last.ts)} · ${escapeHtml(last.byNick)} ${taskHistoryText(last)}</div>` : ''}
+    ${actions}
+  `;
+  return li;
+}
+
+/** 未完结行动项的剩余时间随服务端校准时钟跳动，逾期红色醒目提示 */
+function updateTaskTick() {
+  $$('#task-groups .task-remain').forEach((el) => {
+    const dl = Number(el.dataset.deadline);
+    if (!Number.isFinite(dl)) return;
+    el.textContent = taskRemainText(dl);
+    el.classList.toggle('task-overdue', dl < serverNow());
+  });
+}
+
+// 主持人：打开 / 收起创建表单（默认截止时间为 1 小时后）
+els.btnTaskNew.addEventListener('click', () => {
+  els.taskForm.classList.remove('is-hidden');
+  els.taskDeadline.value = toLocalInputValue(Date.now() + 3600000);
+  els.taskTitleInput.focus();
+});
+
+els.btnTaskFormCancel.addEventListener('click', () => {
+  els.taskForm.classList.add('is-hidden');
+});
+
+// 主持人：创建行动项（负责人 + 事项 + 截止时间，走版本守卫）
+els.taskForm.addEventListener('submit', (e) => {
+  e.preventDefault();
+  const title = els.taskTitleInput.value.trim();
+  if (!title) return toast('请填写事项内容', 'error');
+  const assigneeId = els.taskAssignee.value;
+  if (!assigneeId) return toast('请选择负责人', 'error');
+  const deadline = new Date(els.taskDeadline.value).getTime();
+  if (!Number.isFinite(deadline)) return toast('请选择有效的截止时间', 'error');
+  sendCmd({ type: 'task_create', participantId: assigneeId, title, deadline });
+  els.taskTitleInput.value = '';
+  els.taskForm.classList.add('is-hidden');
+});
+
+// 行动项卡片操作：接受 / 拒绝 / 标记完成 / 确认完成 / 退回处理中
+els.taskGroups.addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-task-act]');
+  if (!btn) return;
+  const type = {
+    accept: 'task_accept',
+    reject: 'task_reject',
+    complete: 'task_complete',
+    confirm: 'task_confirm',
+    return: 'task_return'
+  }[btn.dataset.taskAct];
+  if (!type) return;
+  sendCmd({ type, taskId: btn.dataset.taskId });
+});
 
 function renderLogs(snap) {
   els.logList.textContent = '';

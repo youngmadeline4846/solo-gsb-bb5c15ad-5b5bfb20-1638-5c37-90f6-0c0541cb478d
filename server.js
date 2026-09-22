@@ -28,6 +28,12 @@
  *   { type: "topic_end",    version }                      // 主持人：提前结束并结算当前议题
  *   { type: "topic_vote",   version, topicId, choice }     // choice=yes|no|abstain；截止前可改投
  *   { type: "quota_reset",  version, durationMin }         // 主持人：开启/重置发言配额周期（1~30 分钟）
+ *   { type: "task_create",  version, participantId, title, deadline }  // 主持人：创建行动项（deadline 为 ms 时间戳）
+ *   { type: "task_accept",  version, taskId }     // 负责人：接受（待接受 -> 处理中）
+ *   { type: "task_reject",  version, taskId }     // 负责人：拒绝（待接受 -> 已拒绝）
+ *   { type: "task_complete",version, taskId }     // 负责人：标记完成（处理中 -> 待确认）
+ *   { type: "task_confirm", version, taskId }     // 主持人：确认完成（待确认 -> 已完成）
+ *   { type: "task_return",  version, taskId }     // 主持人：退回处理中（待确认 -> 处理中）
  *
  * 服务端 -> 客户端
  *   { type: "joined",  snapshot, you:{id,secret,host} }
@@ -81,6 +87,17 @@
  * clearTimeout 并替换 room.topic，旧回调直接忽略，绝不结算后续议题。
  * 结算结果（赞成/反对/弃权票数与通过/否决/平票结论）追加到 room.topicHistory
  * 并随快照下发，断线重连后实时票数、剩余时间与已结算结果均连续恢复。
+ *
+ * 行动项：主持人 task_create 从当前成员中指定负责人、填写事项与截止时间
+ * （ms 时间戳）。行动项随快照 tasks 字段下发，状态机为 待接受(pending) ->
+ * 处理中(active) -> 待确认(review) -> 已完成(done)；待接受可被负责人拒绝
+ * （rejected），待确认可被主持人退回处理中。负责人接受/拒绝/标记完成、
+ * 主持人确认/退回，全部经过版本守卫（过期返回 STALE_VERSION + 最新快照），
+ * 并校验操作者身份（TASK_NOT_YOURS / FORBIDDEN）与当前状态
+ * （BAD_TASK_STATE + 最新快照）——多端重复确认、越权跳转都会被拒绝且不
+ * 改变版本。每个行动项保留最近 TASK_HISTORY_LIMIT 条状态变更记录（含操作者
+ * 与时间）随快照下发；已完结行动项保留最近 TASK_RESOLVED_LIMIT 条滚动淘汰。
+ * 行动项无定时任务，断线重连后凭快照完整恢复。
  */
 
 'use strict';
@@ -116,6 +133,17 @@ const TOPIC_MAX_SECONDS = parseInt(process.env.TOPIC_MAX_SECONDS, 10) || 3600;
 const TOPIC_HISTORY_LIMIT = parseInt(process.env.TOPIC_HISTORY_LIMIT, 10) || 20;
 const TOPIC_TITLE_MAX = 80;
 const VOTE_CHOICES = ['yes', 'no', 'abstain'];
+// 行动项：每个行动项保留的最近状态变更记录条数
+const TASK_HISTORY_LIMIT = parseInt(process.env.TASK_HISTORY_LIMIT, 10) || 20;
+// 行动项：已完结（已完成/已拒绝）在房间中保留的数量（超出滚动淘汰）
+const TASK_RESOLVED_LIMIT = parseInt(process.env.TASK_RESOLVED_LIMIT, 10) || 50;
+// 行动项：未完结（待接受/处理中/待确认）数量上限
+const TASK_MAX_OPEN = parseInt(process.env.TASK_MAX_OPEN, 10) || 100;
+const TASK_TITLE_MAX = 120;
+// 行动项截止时间：容忍客户端时钟偏差，过去 5 分钟内的截止时间仍视为有效
+const TASK_DEADLINE_GRACE_MS = 5 * 60 * 1000;
+// 行动项截止时间最远可设为 366 天后
+const TASK_MAX_AHEAD_MS = 366 * 24 * 60 * 60 * 1000;
 
 const app = express();
 const server = http.createServer(app);
@@ -174,6 +202,16 @@ app.use(express.static(path.join(__dirname, 'public')));
  *     id, title, createdAt, closedAt, endedBy,   // endedBy: 'deadline'|'host'|'replaced'
  *     counts: { yes, no, abstain }, total, result  // result: passed|rejected|tie
  *   }],
+ *   tasks: Map<id, {        // 行动项（状态机：pending -> active -> review -> done / rejected）
+ *     id, title,            // 事项内容
+ *     assigneeId,           // 负责人 participantId
+ *     assigneeNick,         // 创建时留存的负责人昵称（成员离开房间后仍可展示）
+ *     createdBy,            // 创建者（主持人）participantId
+ *     createdAt, deadline,  // 创建时间与截止时间（ms 时间戳）
+ *     status,               // pending(待接受)|active(处理中)|review(待确认)|done(已完成)|rejected(已拒绝)
+ *     updatedAt,            // 最近一次状态变更时间
+ *     history: [{ts, from, to, by, byNick}]  // 最近状态变更记录（上限 TASK_HISTORY_LIMIT）
+ *   }>,
  *   logs: [{id, ts, kind, text}],
  *   createdAt, lastSeen
  * }
@@ -197,6 +235,7 @@ function newRoom(code) {
     undo: null,
     topic: null,
     topicHistory: [],
+    tasks: new Map(),
     logs: [],
     createdAt: Date.now(),
     lastSeen: Date.now()
@@ -640,6 +679,63 @@ function buildTopicView(topic) {
 }
 
 // ---------------------------------------------------------------------------
+// 行动项：状态机（待接受 -> 处理中 -> 待确认 -> 已完成 / 已拒绝）
+// ---------------------------------------------------------------------------
+
+const TASK_STATUS_TEXT = {
+  pending: '待接受',
+  active: '处理中',
+  review: '待确认',
+  done: '已完成',
+  rejected: '已拒绝'
+};
+
+/**
+ * 行动项状态流转：更新状态并追加一条状态变更记录
+ * （每个行动项保留最近 TASK_HISTORY_LIMIT 条，超出滚动淘汰）。
+ * 不做版本提交，由调用方负责最终的单次 commit（与议题结算的写法一致）。
+ */
+function transitionTask(task, toStatus, by) {
+  const now = Date.now();
+  task.history.push({ ts: now, from: task.status, to: toStatus, by: by.id, byNick: by.nick });
+  if (task.history.length > TASK_HISTORY_LIMIT) {
+    task.history.splice(0, task.history.length - TASK_HISTORY_LIMIT);
+  }
+  task.status = toStatus;
+  task.updatedAt = now;
+}
+
+/** 已完结行动项滚动淘汰：仅保留最近 TASK_RESOLVED_LIMIT 条（不触碰未完结项，不改变版本） */
+function pruneTasks(room) {
+  const resolved = [];
+  for (const t of room.tasks.values()) {
+    if (t.status === 'done' || t.status === 'rejected') resolved.push(t);
+  }
+  if (resolved.length <= TASK_RESOLVED_LIMIT) return;
+  resolved.sort((a, b) => b.updatedAt - a.updatedAt);
+  for (const t of resolved.slice(TASK_RESOLVED_LIMIT)) {
+    room.tasks.delete(t.id);
+  }
+}
+
+/** 行动项快照视图：负责人昵称实时解析（已离开房间则用创建时留存的昵称） */
+function buildTaskView(room, task) {
+  const assignee = room.participants.get(task.assigneeId);
+  return {
+    id: task.id,
+    title: task.title,
+    assigneeId: task.assigneeId,
+    assigneeNick: assignee ? assignee.nick : task.assigneeNick,
+    createdBy: task.createdBy,
+    createdAt: task.createdAt,
+    deadline: task.deadline,
+    status: task.status,
+    updatedAt: task.updatedAt,
+    history: task.history.map((h) => ({ ts: h.ts, from: h.from, to: h.to, by: h.by, byNick: h.byNick }))
+  };
+}
+
+// ---------------------------------------------------------------------------
 // 安全撤销
 // ---------------------------------------------------------------------------
 
@@ -652,6 +748,7 @@ const UNDO_REASON_TEXT = {
   rollcall_changed: '队首点名接力状态出现新的变更',
   topic_changed: '议题投票状态出现新的变更',
   quota_changed: '发言配额周期出现新的变更',
+  task_changed: '行动项状态出现新的变更',
   cleared: '主持人清空了队列',
   logs_cleared: '主持人清空了操作记录',
   state_changed: '房间状态出现新的变更'
@@ -789,6 +886,7 @@ function uniqueNick(room, nick) {
 function buildSnapshot(room) {
   const serverTs = Date.now();
   pruneSwaps(room);
+  pruneTasks(room);
   return {
     room: room.code,
     version: room.version,
@@ -836,6 +934,7 @@ function buildSnapshot(room) {
     })),
     undo: buildUndoSnapshot(room),
     topic: buildTopicView(room.topic),
+    tasks: [...room.tasks.values()].map((t) => buildTaskView(room, t)),
     topicHistory: room.topicHistory.map((t) => ({
       id: t.id,
       title: t.title,
@@ -973,6 +1072,12 @@ wss.on('connection', (ws) => {
         case 'topic_end':
         case 'topic_vote':
         case 'quota_reset':
+        case 'task_create':
+        case 'task_accept':
+        case 'task_reject':
+        case 'task_complete':
+        case 'task_confirm':
+        case 'task_return':
           return handleCommand(ws, msg, room, pid, isHost);
 
         default:
@@ -1693,6 +1798,112 @@ function handleCommand(ws, msg, room, pid, isHost) {
         `主持人开启新的发言配额周期：每人 ${d} 分钟（周期 ${room.quota.periodId}）`
       );
       return commit(room, { undoReason: 'quota_changed' });
+    }
+
+    case 'task_create': {
+      if (!guardVersion(ws, msg, room) || !requireHost(ws, room, isHost)) return;
+      const title = String(msg.title ?? '').trim().slice(0, TASK_TITLE_MAX);
+      if (!title) {
+        return sendError(ws, '请填写行动项内容', 'NO_TASK_TITLE', room);
+      }
+      // 负责人必须是当前房间成员
+      const assigneeId = String(msg.participantId || '');
+      const assignee = room.participants.get(assigneeId);
+      if (!assignee) {
+        return sendError(ws, '负责人不在当前房间成员中', 'NO_PARTICIPANT', room);
+      }
+      const deadline = Number(msg.deadline);
+      const now = Date.now();
+      if (
+        !Number.isFinite(deadline) ||
+        deadline < now - TASK_DEADLINE_GRACE_MS ||
+        deadline > now + TASK_MAX_AHEAD_MS
+      ) {
+        return sendError(ws, '截止时间无效（须为将来一年内的时间）', 'BAD_DEADLINE', room);
+      }
+      let open = 0;
+      for (const t of room.tasks.values()) {
+        if (t.status === 'pending' || t.status === 'active' || t.status === 'review') open += 1;
+      }
+      if (open >= TASK_MAX_OPEN) {
+        return sendError(ws, `未完结行动项已达上限（${TASK_MAX_OPEN} 条）`, 'TASK_LIMIT', room);
+      }
+      const task = {
+        id: genId('tk_'),
+        title,
+        assigneeId,
+        assigneeNick: assignee.nick, // 成员离开房间后仍按创建时昵称展示
+        createdBy: pid,
+        createdAt: now,
+        deadline: Math.round(deadline),
+        status: 'pending',
+        updatedAt: now,
+        history: [{ ts: now, from: null, to: 'pending', by: pid, byNick: me.nick }]
+      };
+      room.tasks.set(task.id, task);
+      addLog(room, 'task', `主持人创建行动项「${title}」，负责人「${assignee.nick}」`);
+      return commit(room, { undoReason: 'task_changed' });
+    }
+
+    case 'task_accept':
+    case 'task_reject':
+    case 'task_complete': {
+      if (!guardVersion(ws, msg, room)) return;
+      const task = room.tasks.get(String(msg.taskId || ''));
+      if (!task) return sendError(ws, '行动项不存在', 'NO_TASK', room);
+      // 身份校验：仅该行动项的负责人可执行
+      if (task.assigneeId !== pid) {
+        return sendError(ws, '只有该行动项的负责人可以执行此操作', 'TASK_NOT_YOURS', room);
+      }
+      // 状态校验：接受/拒绝要求「待接受」，标记完成要求「处理中」
+      const need = msg.type === 'task_complete' ? 'active' : 'pending';
+      if (task.status !== need) {
+        return sendError(
+          ws,
+          `行动项当前状态为「${TASK_STATUS_TEXT[task.status]}」，无法执行此操作`,
+          'BAD_TASK_STATE',
+          room
+        );
+      }
+      const to =
+        msg.type === 'task_accept' ? 'active' : msg.type === 'task_reject' ? 'rejected' : 'review';
+      transitionTask(task, to, me);
+      let text;
+      if (msg.type === 'task_accept') {
+        text = `「${me.nick}」接受了行动项「${task.title}」，开始处理`;
+      } else if (msg.type === 'task_reject') {
+        text = `「${me.nick}」拒绝了行动项「${task.title}」`;
+      } else {
+        text = `「${me.nick}」将行动项「${task.title}」标记为完成，待主持人确认`;
+      }
+      addLog(room, 'task', text);
+      return commit(room, { undoReason: 'task_changed' });
+    }
+
+    case 'task_confirm':
+    case 'task_return': {
+      if (!guardVersion(ws, msg, room) || !requireHost(ws, room, isHost)) return;
+      const task = room.tasks.get(String(msg.taskId || ''));
+      if (!task) return sendError(ws, '行动项不存在', 'NO_TASK', room);
+      // 状态校验：确认完成 / 退回处理中都仅对「待确认」的行动项有效
+      if (task.status !== 'review') {
+        return sendError(
+          ws,
+          `行动项当前状态为「${TASK_STATUS_TEXT[task.status]}」，无法执行此操作`,
+          'BAD_TASK_STATE',
+          room
+        );
+      }
+      const to = msg.type === 'task_confirm' ? 'done' : 'active';
+      transitionTask(task, to, me);
+      addLog(
+        room,
+        'task',
+        msg.type === 'task_confirm'
+          ? `主持人确认行动项「${task.title}」已完成`
+          : `主持人将行动项「${task.title}」退回处理中`
+      );
+      return commit(room, { undoReason: 'task_changed' });
     }
   }
 }
